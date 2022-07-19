@@ -1,0 +1,90 @@
+def label = "hello-helm-${UUID.randomUUID().toString()}"
+
+/* -------- functions ---------- */
+def notifySlack(STATUS, COLOR) {
+	slackSend (color: COLOR, message: STATUS+" : " +  "${env.JOB_NAME} [${env.BUILD_NUMBER}] (${env.BUILD_URL})")
+}
+
+def notifyMail(STATUS, RECIPIENTS) {
+	emailext body: STATUS+" : " +  "${env.JOB_NAME} [${env.BUILD_NUMBER}] (${env.BUILD_URL})",
+	subject: STATUS + " : " + "${env.JOB_NAME} [${env.BUILD_NUMBER}]",
+	to: RECIPIENTS
+}
+/* ------------------------------ */
+
+def emailRecipients="cmg321111@gmail.com"
+
+notifySlack("STARTED", "#FFFF00")
+notifyMail("STARTED", "${emailRecipients}")
+			
+podTemplate(
+	label: label, 
+	containers: [
+		//container image는 docker search 명령 이용
+		containerTemplate(name: "docker", image: "docker:stable", ttyEnabled: true, command: "cat"),
+		containerTemplate(name: "helm", image: "dtzar/helm-kubectl", ttyEnabled: true, command: "cat")
+	],
+	//volume mount
+	volumes: [
+		hostPathVolume(hostPath: "/var/run/docker.sock", mountPath: "/var/run/docker.sock")
+	]
+) 
+{
+	node(label) {
+		stage("Get source from gitlab") {
+			git "https://gitlab.com/cmg321/auth.git"
+		}
+
+		//-- 환경변수 파일 읽어서 변수값 셋팅
+		def props = readProperties  file:"./deployment/pipeline.properties"
+		def tag = props["version"]
+		def dockerRegistry = props["dockerRegistry"]
+		def credentialRegistry=props["credentialRegistry"]
+		def image = props["image"]
+		def baseDeployDir = props["baseDeployDir"]
+		def helmRepository = props["helmRepository"]
+		def helmChartname = props["helmChartname"]
+		def helmChartfile = "${baseDeployDir}/${helmChartname}-${tag}.tgz"
+		def releaseName = props["releaseName"]
+		def namespace = props["namespace"]
+		
+		try {
+		
+			stage("Buil/push App image") {
+				container("docker") {
+					docker.withRegistry("${dockerRegistry}", "${credentialRegistry}") {
+						sh "docker build -f ${baseDeployDir}/Dockerfile -t ${image}:${tag} ."
+						sh "docker push ${image}:${tag}"
+						sh "docker tag ${image}:${tag} ${image}:latest"
+						sh "docker push ${image}:latest"
+					}
+				}
+			}
+
+			stage( "Clean up current deployments" ) {
+				container("helm") {
+					try {
+						sh "helm delete ${releaseName} --purge"		
+					} catch(e) {
+						echo "Clear-up Error : " + e.getMessage()
+						echo "Continue process !"	
+					}
+				}
+			}
+			
+			stage( "Deploy to cluster" ) {
+				container("helm") {
+					echo "Install with chart file !"
+					sh "helm install ${helmChartfile} --name ${releaseName} --namespace ${namespace}"
+				}
+			}
+
+			notifySlack("${currentBuild.currentResult}", "#00FF00")
+			notifyMail("${currentBuild.currentResult}", "${emailRecipients}")
+		} catch(e) {
+			currentBuild.result = "FAILED"
+			notifySlack("${currentBuild.currentResult}", "#FF0000")
+			notifyMail("${currentBuild.currentResult}", "${emailRecipients}")
+		}
+	}
+}
